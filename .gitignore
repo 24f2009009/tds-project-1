@@ -3,3 +3,6 @@ main.py
 send_task.py
 eval_server.py
 .env
+.venv
+temp.py
+.gitignore

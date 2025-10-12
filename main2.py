@@ -1,20 +1,10 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "fastapi[standard]",
-#   "uvicorn",
-#   "requests",
-#   "python-dotenv",
-#   "pydantic"
-# ]
-# ///
-
 from pydantic import BaseModel, Field
 from typing import List
 import requests
 import os
 import base64
 import time
+import json
 from fastapi import FastAPI, BackgroundTasks, Request
 from dotenv import load_dotenv
 
@@ -40,7 +30,7 @@ def validate_secret(secret: str) -> bool:
 
 
 def create_github_repo(repo_name: str):
-    payload = {"name": repo_name, "private": False, "auto_init": True, "license_template": "mit"}
+    payload = {"name": repo_name, "private": False, "auto_init": False, "license_template": "mit"}
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "accept": "application/vnd.github+json"}
     response = requests.post("https://api.github.com/user/repos", headers=headers, json=payload)
     if response.status_code != 201:
@@ -58,6 +48,32 @@ def enable_github_pages(repo_name: str):
     )
     if response.status_code != 201:
         raise Exception(f"failed to enable github pages: {response.status_code}, {response.text}")
+
+
+def wait_for_pages_enabled(repo_name: str, timeout: int = 120, interval: int = 10):
+    """
+    Polls GitHub Pages API until the site is ready or timeout is reached.
+    """
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "accept": "application/vnd.github+json"}
+    url = f"https://api.github.com/repos/24f2009009/{repo_name}/pages"
+
+    start = time.time()
+    while True:
+        resp = requests.get(url, headers=headers)
+        if resp.status_code == 200:
+            status = resp.json().get("status", "")
+            if status in ("built", "ready"):
+                print("✅ GitHub Pages is live.")
+                return
+            else:
+                print(f"⏳ Waiting for GitHub Pages... (status: {status})")
+        else:
+            print(f"⚠️ Pages status check failed: {resp.status_code}")
+
+        if time.time() - start > timeout:
+            raise TimeoutError("Timed out waiting for GitHub Pages to become ready.")
+        time.sleep(interval)
+
 
 def get_file_sha(repo_name: str, file_path: str):
     """Check if a file already exists and return its SHA if present."""
@@ -103,38 +119,83 @@ def push_files_to_repo(repo_name: str, files: dict, round_num: int):
 
 
 
-def write_code_with_llm(brief: str, description: str = "", attachments: list | None = None) -> list[dict]:
-    """Uses OpenAI API (via aipipe.org endpoint) to generate a small static web app."""
-    import json
+def write_code_with_llm(
+    brief: str,
+    description: str = "",
+    attachments: list | None = None,
+    checks: list | None = None
+) -> list[dict]:
+    """
+    Uses OpenAI API (via aipipe.org endpoint) to generate a single-page web app.
+    Supports attachments by fetching their content. All CSS/JS is inlined.
+    Validates output against LLMResponse schema.
+    """
 
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
     OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL', 'https://aipipe.org/openai/v1')
 
+    # Prepare checks text
+    checks_text = "\n".join(f"- {c}" for c in checks or []) if isinstance(checks, list) else "None"
+
+    # Fetch attachment contents
+    attachment_texts = []
+    for url in attachments or []:
+        try:
+            r = requests.get(url, timeout=5)
+            r.raise_for_status()
+            content_preview = r.text[:2000]  # truncate if too long
+            attachment_texts.append(f"URL: {url}\nContent (truncated to 2000 chars):\n{content_preview}")
+        except Exception as e:
+            attachment_texts.append(f"URL: {url}\nCould not fetch content: {e}")
+
+    attachments_text = "\n\n".join(attachment_texts) if attachment_texts else "None"
+
+    # Separate system prompt and user prompt
     system_prompt = (
         "You are a professional web developer. "
-        "Generate a minimal static web page (HTML/CSS/JS only) that satisfies the given brief. "
-        "Return a JSON object exactly matching this schema:\n"
-        "{ 'files': [ { 'name': string, 'content': string }, ... ] }\n"
-        "Avoid external APIs or credentials. "
-        "At minimum include index.html, README.md, and LICENSE if missing."
+        "Generate clean, production-ready HTML for a single-page web app."
     )
 
-    user_prompt = (
-        f"Brief:\n{brief}\n\n"
-        f"Description:\n{description or '(none)'}\n\n"
-        f"Attachments:\n{attachments or 'None'}"
-    )
+    user_prompt = f"""
+User task:
 
+{brief}
+
+Checks to satisfy:
+{checks_text}
+
+Important Requirements:
+- Generate **at least** these files:
+  - index.html: complete single-page web app with inline CSS/JS.
+  - README.md: a markdown file describing the project, usage instructions, and any relevant notes.
+- Do not reference external `.css` or `.js` files.
+- May use CDNs for libraries if needed.
+- Visually polished, modern, and responsive design.
+- Use descriptive element IDs as specified in the brief.
+- Valid and accessible HTML.
+- Avoid placeholders like `${{seed}}`.
+
+Attachments content (if any):
+{attachments_text}
+
+Existing code or description:
+{description or "(none)"}
+
+Output only the files in JSON format exactly matching this schema:
+{{ "files": [ {{ "name": string, "content": string }} ] }}
+"""
+
+
+    # Call OpenAI API
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "gpt-5-nano",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_prompt}
         ],
         "response_format": {"type": "json_object"},
     }
-
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
     resp = requests.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
     if resp.status_code != 200:
@@ -148,6 +209,8 @@ def write_code_with_llm(brief: str, description: str = "", attachments: list | N
         raise Exception(f"Failed to parse or validate LLM output: {e}")
 
     return [f.model_dump() for f in validated.files]
+
+
 
 
 def send_evaluation_callback(data: dict, repo_name: str):
@@ -189,12 +252,14 @@ def round1(data):
     files = write_code_with_llm(
         brief=data["brief"],
         description=data.get("description", ""),
-        attachments=data.get("attachments")
+        attachments=data.get("attachments"),
+        checks=data.get("checks", [])
     )
     repo_name = f"{data['task']}_{data['nonce']}"
     create_github_repo(repo_name)
     push_files_to_repo(repo_name, files, 1)
     enable_github_pages(repo_name)
+    wait_for_pages_enabled(repo_name)
     send_evaluation_callback(data, repo_name)
 
 
@@ -215,10 +280,12 @@ def round2(data):
     updated_files = write_code_with_llm(
         brief=f"Refactor or extend the following existing page according to the new brief:\n{data['brief']}",
         description=f"Existing code (truncated if too long):\n{existing_snippet}",
+        attachments=data.get("attachments"),
+        checks=data.get("checks", [])
     )
 
     push_files_to_repo(repo_name, updated_files, 2)
-    enable_github_pages(repo_name)
+    wait_for_pages_enabled(repo_name)
     send_evaluation_callback(data, repo_name)
 
 
