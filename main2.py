@@ -7,6 +7,8 @@ import time
 import json
 from fastapi import FastAPI, BackgroundTasks, Request
 from dotenv import load_dotenv
+from pydantic_ai import Agent,Tool
+from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 
 load_dotenv()
 
@@ -87,7 +89,6 @@ def get_file_sha(repo_name: str, file_path: str):
         return resp.json().get("sha")
     return None
 
-
 def push_files_to_repo(repo_name: str, files: dict, round_num: int):
     """Push multiple files to a repo (creates or updates cleanly)."""
     headers = {
@@ -116,99 +117,70 @@ def push_files_to_repo(repo_name: str, files: dict, round_num: int):
                 f"Failed to push {file_name}: {response.status_code}, {response.text}"
             )
 
-
-
-
 def write_code_with_llm(
     brief: str,
     description: str = "",
     attachments: list | None = None,
-    checks: list | None = None
+    checks: list | None = None,
 ) -> list[dict]:
     """
-    Uses OpenAI API (via aipipe.org endpoint) to generate a single-page web app.
-    Supports attachments by fetching their content. All CSS/JS is inlined.
-    Validates output against LLMResponse schema.
+    Generates a single-page web app using a pydantic-ai agent.
+    Allows the agent to use DuckDuckGo for contextual search.
     """
 
-    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-    OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL', 'https://aipipe.org/openai/v1')
-
-    # Prepare checks text
-    checks_text = "\n".join(f"- {c}" for c in checks or []) if isinstance(checks, list) else "None"
-
-    # Fetch attachment contents
-    attachment_texts = []
-    for url in attachments or []:
-        try:
-            r = requests.get(url, timeout=5)
-            r.raise_for_status()
-            content_preview = r.text[:2000]  # truncate if too long
-            attachment_texts.append(f"URL: {url}\nContent (truncated to 2000 chars):\n{content_preview}")
-        except Exception as e:
-            attachment_texts.append(f"URL: {url}\nCould not fetch content: {e}")
-
-    attachments_text = "\n\n".join(attachment_texts) if attachment_texts else "None"
-
-    # Separate system prompt and user prompt
     system_prompt = (
         "You are a professional web developer. "
-        "Generate clean, production-ready HTML for a single-page web app."
+        "Generate a production-ready single-page HTML app with inline CSS/JS only. "
+        "Use the DuckDuckGo search tool if you need references or design inspiration."
     )
+
+    checks_text = "\n".join(f"- {c}" for c in checks or []) if isinstance(checks, list) else "None"
 
     user_prompt = f"""
 User task:
-
 {brief}
 
 Checks to satisfy:
 {checks_text}
 
-Important Requirements:
-- Generate **at least** these files:
-  - index.html: complete single-page web app with inline CSS/JS.
-  - README.md: a markdown file describing the project, usage instructions, and any relevant notes.
-- Do not reference external `.css` or `.js` files.
-- May use CDNs for libraries if needed.
-- Visually polished, modern, and responsive design.
-- Use descriptive element IDs as specified in the brief.
-- Valid and accessible HTML.
-- Avoid placeholders like `${{seed}}`.
-
-Attachments content (if any):
-{attachments_text}
-
-Existing code or description:
+Existing context:
 {description or "(none)"}
 
-Output only the files in JSON format exactly matching this schema:
-{{ "files": [ {{ "name": string, "content": string }} ] }}
+Attachments:
+{attachments or "None"}
+
+Output format:
+{{ "files": [ {{ "name": "index.html", "content": "<html>..." }},
+              {{ "name": "README.md", "content": "# ..." }} ] }}
 """
 
+    # ✅ Define the search tool with typed argument
+    def duckduckgo_search(query: str) -> str:
+        """Search the web using DuckDuckGo and return summarized results."""
+        return duckduckgo_search_tool(query)
 
-    # Call OpenAI API
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "gpt-5-nano",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "response_format": {"type": "json_object"},
-    }
+    search_tool = Tool(
+        name="duckduckgo_search",
+        description="Search DuckDuckGo for helpful web results.",
+        function=duckduckgo_search,
+    )
 
-    resp = requests.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
-    if resp.status_code != 200:
-        raise Exception(f"OpenAI request failed: {resp.status_code}, {resp.text}")
+    agent = Agent(
+        model="gpt-5-nano",
+        system_prompt=system_prompt,
+        tools=[search_tool],
+    )
+
+    result = agent.run_sync(user_prompt)
 
     try:
-        content = resp.json()["choices"][0]["message"]["content"]
-        data = json.loads(content)
+        data = json.loads(result.output)
         validated = LLMResponse(**data)
     except Exception as e:
         raise Exception(f"Failed to parse or validate LLM output: {e}")
 
     return [f.model_dump() for f in validated.files]
+
 
 
 
@@ -255,7 +227,7 @@ def round1(data):
         attachments=data.get("attachments"),
         checks=data.get("checks", [])
     )
-    repo_name = f"{data['task']}_{data['nonce']}"
+    repo_name = f"{data['task']}"
     create_github_repo(repo_name)
     push_files_to_repo(repo_name, files, 1)
     enable_github_pages(repo_name)
@@ -264,7 +236,7 @@ def round1(data):
 
 
 def round2(data):
-    repo_name = f"{data['task']}_{data['nonce']}"
+    repo_name = f"{data['task']}"
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "accept": "application/vnd.github+json"}
 
     response = requests.get(
